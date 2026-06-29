@@ -1,1 +1,181 @@
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Clipboard CMD Tool</title>
+<style>
+body { font-family: monospace; background: #111; color: #eee; padding: 20px; }
+#terminal { width: 100%; height: 80vh; background: #000; color: #0f0; padding: 10px; overflow-y: auto; white-space: pre-wrap; }
+#input { width: 100%; background: #111; color: #0f0; border: none; outline: none; font-family: monospace; font-size: 1em; }
+</style>
+</head>
+<body>
 
+<div id="terminal"></div>
+<input id="input" placeholder="Type command here...">
+
+<script>
+const clipboardStore = {};
+const terminal = document.getElementById('terminal');
+const input = document.getElementById('input');
+
+function log(msg) {
+    terminal.textContent += msg + '\n';
+    terminal.scrollTop = terminal.scrollHeight;
+}
+
+log("Commands: copy <name>, paste <name>, delete <name>, see, save, load");
+
+// -------- COMMAND HANDLER --------
+input.addEventListener('keydown', async e => {
+    if (e.key !== 'Enter') return;
+    const cmdLine = input.value.trim();
+    log('> ' + cmdLine);
+    input.value = '';
+    await handleCommand(cmdLine);
+});
+
+async function handleCommand(cmdLine) {
+    const [cmd, ...args] = cmdLine.split(/\s+/);
+    const name = args.join(' ');
+
+    try {
+        switch(cmd.toLowerCase()) {
+            case 'copy': if (!name) return log('Specify name'); await copyCommand(name); break;
+            case 'paste': if (!name) return log('Specify name'); await pasteCommand(name); break;
+            case 'delete': if (!name) return log('Specify name'); deleteCommand(name); break;
+            case 'see': seeCommand(); break;
+            case 'save': await saveCommand(); break;
+            case 'load': await loadCommand(); break;
+            default: log(`Unknown command: ${cmd}`);
+        }
+    } catch(e) {
+        log('Error: ' + e.message);
+    }
+}
+
+// -------- COPY --------
+async function copyCommand(name) {
+    const items = await navigator.clipboard.read();
+    if (!items.length) return log('Clipboard empty or unsupported');
+
+    const entryData = {};
+    const item = items[0]; // only first ClipboardItem (browser limitation)
+    for (const type of item.types) {
+        const blob = await item.getType(type);
+        const buffer = new Uint8Array(await blob.arrayBuffer());
+        entryData[type] = buffer;
+    }
+    clipboardStore[name] = entryData;
+    log(`Copied clipboard to "${name}"`);
+}
+
+// -------- PASTE --------
+async function pasteCommand(name) {
+    const entryData = clipboardStore[name];
+    if (!entryData) return log('Entry not found');
+
+    // Combine all types into a single ClipboardItem
+    const blobMap = {};
+    for (const [type, buffer] of Object.entries(entryData)) {
+        blobMap[type] = new Blob([buffer], { type });
+    }
+
+    try {
+        await navigator.clipboard.write([new ClipboardItem(blobMap)]);
+        log(`Pasted "${name}" to clipboard`);
+    } catch(e) {
+        log('Paste failed: ' + e.message);
+    }
+}
+
+// -------- DELETE --------
+function deleteCommand(name) {
+    if (!clipboardStore[name]) return log('Entry not found');
+    delete clipboardStore[name];
+    log(`Deleted entry "${name}"`);
+}
+
+// -------- SEE --------
+function seeCommand() {
+    if (!Object.keys(clipboardStore).length) return log('No entries');
+    for (const [name, types] of Object.entries(clipboardStore)) {
+        log(`${name}: ${Object.keys(types).join(', ')}`);
+    }
+}
+
+// -------- SAVE --------
+async function saveCommand() {
+    const handle = await window.showSaveFilePicker({
+        suggestedName: 'clipboard_save.bin',
+        types: [{ description: 'Clipboard Save', accept: { 'application/octet-stream': ['.bin'] } }]
+    });
+    const writable = await handle.createWritable();
+
+    // Format: [nameLen][nameBytes][typeCount][for each type: typeLen][typeBytes][dataLen][dataBytes]
+    const chunks = [];
+    for (const [name, types] of Object.entries(clipboardStore)) {
+        const nameBytes = new TextEncoder().encode(name);
+        chunks.push(new Uint32Array([nameBytes.length]).buffer);
+        chunks.push(nameBytes);
+
+        const typeEntries = Object.entries(types);
+        chunks.push(new Uint32Array([typeEntries.length]).buffer);
+
+        for (const [type, buffer] of typeEntries) {
+            const typeBytes = new TextEncoder().encode(type);
+            chunks.push(new Uint32Array([typeBytes.length]).buffer);
+            chunks.push(typeBytes);
+            chunks.push(new Uint32Array([buffer.length]).buffer);
+            chunks.push(buffer);
+        }
+    }
+
+    // Combine all chunks into one Uint8Array
+    const totalLen = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+    const finalBuffer = new Uint8Array(totalLen);
+    let offset = 0;
+    for (const chunk of chunks) {
+        finalBuffer.set(new Uint8Array(chunk), offset);
+        offset += chunk.byteLength;
+    }
+
+    await writable.write(finalBuffer);
+    await writable.close();
+    log('Saved clipboard to file');
+}
+
+// -------- LOAD --------
+async function loadCommand() {
+    const [handle] = await window.showOpenFilePicker({ multiple: false });
+    const file = await handle.getFile();
+    const buffer = await file.arrayBuffer();
+    const view = new DataView(buffer);
+    let offset = 0;
+
+    while (offset < buffer.byteLength) {
+        const nameLen = view.getUint32(offset, true); offset += 4;
+        const nameBytes = new Uint8Array(buffer, offset, nameLen); offset += nameLen;
+        const name = new TextDecoder().decode(nameBytes);
+
+        const typeCount = view.getUint32(offset, true); offset += 4;
+        const types = {};
+
+        for (let i = 0; i < typeCount; i++) {
+            const typeLen = view.getUint32(offset, true); offset += 4;
+            const typeBytes = new Uint8Array(buffer, offset, typeLen); offset += typeLen;
+            const type = new TextDecoder().decode(typeBytes);
+
+            const dataLen = view.getUint32(offset, true); offset += 4;
+            const data = new Uint8Array(buffer, offset, dataLen); offset += dataLen;
+
+            types[type] = data;
+        }
+
+        clipboardStore[name] = types;
+    }
+
+    log('Loaded entries from file');
+}
+</script>
+</body>
+</html>
